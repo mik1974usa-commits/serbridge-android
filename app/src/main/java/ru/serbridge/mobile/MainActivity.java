@@ -715,6 +715,8 @@ public class MainActivity extends Activity implements Bridge.Listener, Meter.Eve
         Map<String, String> kv = Bridge.parseKv(r);
         info("Мост «" + v(kv, "name") + "»: " + v(kv, "ip") + ", режим " + v(kv, "mode")
                 + ", сигнал " + v(kv, "rssi") + " дБм");
+        if (kv.containsKey("meters"))
+            info("Подключено клиентов: поток данных " + v(kv, "client") + ", измерения " + v(kv, "meters"));
         info("UART: " + v(kv, "baud") + " бод; от МК принято " + v(kv, "rx") + " байт, в МК передано "
                 + v(kv, "tx") + " байт; в буфере " + v(kv, "pending") + " байт, потеряно " + v(kv, "lost") + " байт");
         if (kv.containsKey("tvcc")) {
