@@ -1,0 +1,41 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'ru.serbridge.mobile'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'ru.serbridge.mobile'
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName '1.0'
+    }
+
+    // Постоянный ключ подписи: тогда новую сборку можно ставить поверх старой без удаления.
+    // GitHub Actions раскладывает его из signing/debug.keystore.b64; без него — обычный ключ Android SDK.
+    def ks = rootProject.file('signing/debug.keystore')
+    signingConfigs {
+        debug {
+            if (ks.exists()) {
+                storeFile ks
+                storePassword 'android'
+                keyAlias 'androiddebugkey'
+                keyPassword 'android'
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+}
