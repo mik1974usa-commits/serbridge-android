@@ -142,15 +142,22 @@ final class AuxView {
         }
     }
 
+    /** Номер ворот по расстоянию: по умолчанию у LD2410 ворота по 75 см, всего 0…8. */
+    static int gate(int cm) {
+        return Math.min(8, cm / 75);
+    }
+
     static String describe(Ld2410.Report r) {
         switch (r.state) {
             case 1:
-                return "движение " + r.moveCm + " см (энергия " + r.moveEnergy + ")";
+                return "движение " + r.moveCm + " см (ворота " + gate(r.moveCm) + ", энергия " + r.moveEnergy + ")";
             case 2:
-                return "неподвижная цель " + r.stillCm + " см (энергия " + r.stillEnergy + ")";
+                return "неподвижная цель " + r.stillCm + " см (ворота " + gate(r.stillCm)
+                        + ", энергия " + r.stillEnergy + ")";
             case 3:
-                return "движение " + r.moveCm + " см (" + r.moveEnergy + "), неподвижная цель "
-                        + r.stillCm + " см (" + r.stillEnergy + ")";
+                return "движение " + r.moveCm + " см (ворота " + gate(r.moveCm) + ", энергия " + r.moveEnergy
+                        + "), неподвижная цель " + r.stillCm + " см (ворота " + gate(r.stillCm)
+                        + ", энергия " + r.stillEnergy + ")";
             default:
                 return "никого нет";
         }
@@ -173,11 +180,12 @@ final class AuxView {
         Ld2410.Report r = last;
         switch (r.state) {
             case 1:
-                return "движ. " + r.moveCm + " см/" + r.moveEnergy;
+                return "движ. в" + gate(r.moveCm) + " " + r.moveCm + " см/" + r.moveEnergy;
             case 2:
-                return "неподв. " + r.stillCm + " см/" + r.stillEnergy;
+                return "неподв. в" + gate(r.stillCm) + " " + r.stillCm + " см/" + r.stillEnergy;
             case 3:
-                return "движ. " + r.moveCm + " см/" + r.moveEnergy + ", неподв. " + r.stillCm + " см/" + r.stillEnergy;
+                return "движ. в" + gate(r.moveCm) + " " + r.moveCm + " см/" + r.moveEnergy
+                        + ", неподв. в" + gate(r.stillCm) + " " + r.stillCm + " см/" + r.stillEnergy;
             default:
                 return "никого";
         }
