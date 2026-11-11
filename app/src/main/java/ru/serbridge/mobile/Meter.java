@@ -82,8 +82,9 @@ final class Meter {
         lastData = now;
         for (int i = 0; i < N; i++) {
             String v = kv.get(String.valueOf(i + 1));
-            if (v == null) {
+            if (v == null) {                   // канал выключен: после включения тревога сработает заново
                 value[i] = null;
+                alarmActive[i] = false;
                 continue;
             }
             String[] p = v.split(":");

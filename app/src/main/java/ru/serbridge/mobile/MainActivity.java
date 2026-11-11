@@ -3,9 +3,14 @@ package ru.serbridge.mobile;
 import android.app.ActionBar;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Typeface;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -152,13 +157,15 @@ public class MainActivity extends Activity implements Bridge.Listener, Meter.Eve
         info("SerialBridge для Android. Строка без «:» уходит в МК, «:help» — список команд.");
         info("Нажатие на панель напряжений — показать/скрыть мин/макс, долгое нажатие — сбросить их.");
         updateSubtitle();
-        ui.post(tick);
     }
 
     @Override
     protected void onStart() {
         super.onStart();
+        watchWifi(true);
         bridge.start();
+        ui.removeCallbacks(tick);
+        ui.post(tick);
         if (bridge.host() == null && !started) discover(true);
         started = true;
     }
@@ -167,8 +174,55 @@ public class MainActivity extends Activity implements Bridge.Listener, Meter.Eve
     protected void onStop() {
         // Пока приложение свёрнуто, мост копит вывод МК (до 32 КБ) и отдаст его при возвращении.
         bridge.stop();
+        watchWifi(false);
+        ui.removeCallbacks(tick);                    // в фоне панель обновлять незачем
         dataUp = false;
         super.onStop();
+    }
+
+    @Override
+    protected void onDestroy() {
+        ui.removeCallbacksAndMessages(null);
+        bridge.shutdown();
+        super.onDestroy();
+    }
+
+    // ---- привязка к Wi-Fi
+    // Если у сети Wi-Fi нет выхода в интернет (например, сеть самого моста SerBridge-XXXX),
+    // Android шлёт трафик приложений через мобильные данные, и мост недоступен.
+    // Поэтому, пока есть Wi-Fi, весь сетевой обмен приложения идёт именно через него.
+    private ConnectivityManager.NetworkCallback wifiCallback;
+
+    private void watchWifi(boolean on) {
+        ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (cm == null) return;
+        try {
+            if (on && wifiCallback == null) {
+                wifiCallback = new ConnectivityManager.NetworkCallback() {
+                    @Override
+                    public void onAvailable(Network network) {
+                        cm.bindProcessToNetwork(network);
+                        bridge.reconnect();          // соединения, начатые не через Wi-Fi, — заново
+                    }
+
+                    @Override
+                    public void onLost(Network network) {
+                        // При переходе между сетями Wi-Fi новая может появиться раньше, чем пропадёт старая
+                        if (network.equals(cm.getBoundNetworkForProcess())) cm.bindProcessToNetwork(null);
+                    }
+                };
+                NetworkRequest req = new NetworkRequest.Builder()
+                        .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                        .build();
+                cm.registerNetworkCallback(req, wifiCallback);
+            } else if (!on && wifiCallback != null) {
+                cm.unregisterNetworkCallback(wifiCallback);
+                wifiCallback = null;
+                cm.bindProcessToNetwork(null);
+            }
+        } catch (RuntimeException e) {
+            wifiCallback = null;                     // без привязки — работаем через сеть по умолчанию
+        }
     }
 
     private final Runnable tick = new Runnable() {
@@ -615,6 +669,10 @@ public class MainActivity extends Activity implements Bridge.Listener, Meter.Eve
             warn("МК без питания (нет напряжения на XP2.3) — не отправлено.");
             return;
         }
+        if (!dataUp) {
+            warn("Нет связи с мостом — не отправлено.");
+            return;
+        }
         bridge.send(out);
         info("Отправлено байт: " + out.length);
     }
@@ -713,8 +771,9 @@ public class MainActivity extends Activity implements Bridge.Listener, Meter.Eve
         }
         takeStatus(r);
         Map<String, String> kv = Bridge.parseKv(r);
+        String rssi = v(kv, "rssi");
         info("Мост «" + v(kv, "name") + "»: " + v(kv, "ip") + ", режим " + v(kv, "mode")
-                + ", сигнал " + v(kv, "rssi") + " дБм");
+                + (rssi.equals("0") || rssi.equals("?") ? "" : ", сигнал " + rssi + " дБм"));
         if (kv.containsKey("meters"))
             info("Подключено клиентов: поток данных " + v(kv, "client") + ", измерения " + v(kv, "meters"));
         info("UART: " + v(kv, "baud") + " бод; от МК принято " + v(kv, "rx") + " байт, в МК передано "
@@ -781,6 +840,11 @@ public class MainActivity extends Activity implements Bridge.Listener, Meter.Eve
         }, "serbridge-find").start();
     }
 
+    /** Диалоги нельзя показывать, если окно уже закрывается. */
+    private boolean gone() {
+        return isFinishing() || isDestroyed();
+    }
+
     private void onFound(List<Bridge.Found> found, boolean auto) {
         if (found.isEmpty()) {
             warn("Мост не найден. Телефон должен быть в той же сети Wi-Fi, что и мост, "
@@ -792,6 +856,7 @@ public class MainActivity extends Activity implements Bridge.Listener, Meter.Eve
             connectTo(found.get(0));
             return;
         }
+        if (gone()) return;
         final Bridge.Found[] arr = found.toArray(new Bridge.Found[0]);
         String[] items = new String[arr.length];
         for (int i = 0; i < arr.length; i++) items[i] = arr[i].toString();
@@ -828,6 +893,7 @@ public class MainActivity extends Activity implements Bridge.Listener, Meter.Eve
     }
 
     private void showConnectDialog() {
+        if (gone()) return;
         final EditText et = new EditText(this);
         String h = bridge.host();
         et.setText(h != null ? h : "192.168.4.1");

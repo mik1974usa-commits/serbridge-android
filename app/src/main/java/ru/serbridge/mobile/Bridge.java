@@ -4,6 +4,7 @@ import android.content.Context;
 import android.net.DhcpInfo;
 import android.net.wifi.WifiManager;
 
+import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -77,7 +78,10 @@ public final class Bridge {
 
     private final Listener listener;
     private final Object lock = new Object();
-    private final ExecutorService io = Executors.newSingleThreadExecutor();
+    // Отправка в МК и команды мосту — в разных потоках: долгая команда к недоступному мосту
+    // (до 7 с ожидания) не должна задерживать строки, отправляемые в МК.
+    private final ExecutorService sendIo = Executors.newSingleThreadExecutor();
+    private final ExecutorService ctrlIo = Executors.newSingleThreadExecutor();
 
     private volatile String host;
     private volatile int dataPort = DATA_PORT, ctrlPort = CTRL_PORT, meterPort = METER_PORT;
@@ -107,6 +111,13 @@ public final class Bridge {
         meterThread = new Thread(() -> meterLoop(g), "serbridge-meter");
         dataThread.start();
         meterThread.start();
+    }
+
+    /** Окончательно: остановить всё и освободить потоки (при закрытии приложения). */
+    public void shutdown() {
+        stop();
+        sendIo.shutdownNow();
+        ctrlIo.shutdownNow();
     }
 
     public synchronized void stop() {
@@ -158,16 +169,19 @@ public final class Bridge {
                 s.connect(new InetSocketAddress(h, dataPort), 3000);
                 s.setKeepAlive(true);
                 s.setTcpNoDelay(true);
-                if (!alive(g) || !h.equals(host)) continue;
+                // Сначала опубликовать сокет, потом проверить: иначе stop()/setTarget(), пришедшие
+                // между проверкой и публикацией, не смогли бы его закрыть, и поток остался бы висеть.
                 dataSock = s;
+                if (!alive(g) || !h.equals(host)) continue;
                 wasUp = true;
                 listener.onDataState(true, null);
                 InputStream in = s.getInputStream();
                 int n;
-                while ((n = in.read(buf)) > 0) listener.onDataBytes(Arrays.copyOf(buf, n));
+                while ((n = in.read(buf)) > 0 && alive(g)) listener.onDataBytes(Arrays.copyOf(buf, n));
                 if (alive(g)) listener.onDataState(false, "мост закрыл соединение");
             } catch (IOException e) {
-                if (alive(g)) listener.onDataState(false, wasUp ? "связь прервалась" : describe(e));
+                // Соединение закрыли мы сами при смене моста — сообщать не о чем
+                if (alive(g) && h.equals(host)) listener.onDataState(false, wasUp ? "связь прервалась" : describe(e));
             } finally {
                 dataSock = null;
                 closeQuietly(s);
@@ -191,13 +205,13 @@ public final class Bridge {
                 s.connect(new InetSocketAddress(h, meterPort), 3000);
                 s.setKeepAlive(true);
                 s.setSoTimeout(METER_SILENCE_MS);
+                meterSock = s;                              // см. dataLoop: сначала опубликовать
                 if (!alive(g) || !h.equals(host)) continue;
-                meterSock = s;
                 listener.onMeterState(true, null);
-                InputStream in = s.getInputStream();
+                InputStream in = new BufferedInputStream(s.getInputStream(), 2048);
                 ByteArrayOutputStream line = new ByteArrayOutputStream(128);
                 int c;
-                while ((c = in.read()) >= 0) {
+                while ((c = in.read()) >= 0 && alive(g)) {
                     if (c == '\n') {
                         gotLine = true;
                         listener.onMeterLine(new String(line.toByteArray(), StandardCharsets.UTF_8).trim());
@@ -216,6 +230,10 @@ public final class Bridge {
                 meterSock = null;
                 closeQuietly(s);
             }
+            // Мост слал измерения и вдруг пропал (перезагрузка, обрыв Wi-Fi): соединение данных
+            // в таком случае «висит» без признаков обрыва — Android заметит его лишь через часы.
+            // Рвём и его, чтобы поток данных переподключился вместе с измерениями.
+            if (gotLine && alive(g) && h.equals(host)) closeQuietly(dataSock);
             if (alive(g)) pause(false, gotLine ? 300 : 2000);
         }
     }
@@ -238,7 +256,7 @@ public final class Bridge {
     // ------------------------------------------------------------------ отправка и команды
 
     public void send(final byte[] bytes) {
-        io.execute(() -> {
+        sendIo.execute(() -> {
             Socket s = dataSock;
             if (s == null) {
                 listener.onSendFailed("нет связи с мостом — не отправлено");
@@ -258,7 +276,7 @@ public final class Bridge {
     public void command(final String cmd, final Reply reply) {
         final String h = host;
         final int port = ctrlPort;
-        io.execute(() -> {
+        ctrlIo.execute(() -> {
             if (h == null) {
                 reply.onReply("ERR мост не выбран");
                 return;
@@ -267,17 +285,7 @@ public final class Bridge {
             try (Socket s = new Socket()) {
                 s.connect(new InetSocketAddress(h, port), 3000);
                 s.setSoTimeout(4000);
-                InputStream in = s.getInputStream();
-                // Если мост здоровается при подключении — пропустить приветствие.
-                try {
-                    Thread.sleep(150);
-                } catch (InterruptedException ignored) {
-                    Thread.currentThread().interrupt();
-                }
-                byte[] skip = new byte[256];
-                while (in.available() > 0 && in.read(skip) > 0) {
-                    // приветствие отброшено
-                }
+                InputStream in = new BufferedInputStream(s.getInputStream(), 512);
                 OutputStream out = s.getOutputStream();
                 out.write((cmd + "\n").getBytes(StandardCharsets.UTF_8));
                 out.flush();
