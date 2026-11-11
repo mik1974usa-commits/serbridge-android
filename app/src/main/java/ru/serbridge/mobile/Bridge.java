@@ -31,7 +31,8 @@ import java.util.concurrent.Executors;
  *   2323/TCP — поток данных МК (прозрачный);
  *   2324/TCP — управление: строка-команда → строка-ответ «OK …» / «ERR …»;
  *   2325/UDP — поиск: «SERBRIDGE?» → «SERBRIDGE name=… data=… ctrl=… baud=…»;
- *   2326/TCP — измерения: строки H / V / E / T.
+ *   2326/TCP — измерения: строки H / V / E / T;
+ *   2327/TCP — второй приёмник (XP2.6, «:aux uart <бод>»): байты как есть, только чтение.
  * Все методы Listener вызываются из сетевых потоков.
  */
 public final class Bridge {
@@ -46,6 +47,10 @@ public final class Bridge {
         void onMeterState(boolean connected, String why);
 
         void onSendFailed(String why);
+
+        void onAuxBytes(byte[] data);
+
+        void onAuxState(boolean connected);
     }
 
     public interface Reply {
@@ -73,7 +78,8 @@ public final class Bridge {
         }
     }
 
-    public static final int DATA_PORT = 2323, CTRL_PORT = 2324, FIND_PORT = 2325, METER_PORT = 2326;
+    public static final int DATA_PORT = 2323, CTRL_PORT = 2324, FIND_PORT = 2325, METER_PORT = 2326, AUX_PORT = 2327;
+    private static final int K_DATA = 0, K_METER = 1, K_AUX = 2;
     private static final int METER_SILENCE_MS = 4000;   // мост шлёт строку хотя бы раз в секунду
 
     private final Listener listener;
@@ -87,9 +93,12 @@ public final class Bridge {
     private volatile int dataPort = DATA_PORT, ctrlPort = CTRL_PORT, meterPort = METER_PORT;
     private volatile boolean running;
     private volatile int gen;                       // поколение потоков: после stop/start старые выходят
-    private volatile Socket dataSock, meterSock;
-    private boolean kickData, kickMeter;            // под lock: «не ждать, переподключиться сразу»
-    private Thread dataThread, meterThread;
+    // Открытые соединения (под lock). Сокет публикуется и закрывается под одной блокировкой
+    // вместе с проверкой «поток ещё нужен»: иначе stop()/setTarget(), пришедшие, пока поток
+    // подключался, могли бы его не закрыть, и он остался бы висеть лишним клиентом моста.
+    private final Socket[] socks = new Socket[3];
+    private final boolean[] kick = new boolean[3];  // под lock: «не ждать, переподключиться сразу»
+    private Thread dataThread, meterThread, auxThread;
 
     public Bridge(Listener listener) {
         this.listener = listener;
@@ -100,7 +109,40 @@ public final class Bridge {
     }
 
     public boolean isDataConnected() {
-        return dataSock != null;
+        return sock(K_DATA) != null;
+    }
+
+    private Socket sock(int which) {
+        synchronized (lock) {
+            return socks[which];
+        }
+    }
+
+    /** Опубликовать подключённый сокет; false — поток уже не нужен (остановлен или сменился мост). */
+    private boolean publish(int which, Socket s, int g, String h) {
+        synchronized (lock) {
+            if (!alive(g) || !h.equals(host)) return false;
+            socks[which] = s;
+            return true;
+        }
+    }
+
+    private void unpublish(int which, Socket s) {
+        synchronized (lock) {
+            if (socks[which] == s) socks[which] = null;
+        }
+    }
+
+    /** Закрыть соединения (все или указанные) и разбудить потоки. */
+    private void closeAll(int... which) {
+        synchronized (lock) {
+            if (which.length == 0) which = new int[]{K_DATA, K_METER, K_AUX};
+            for (int w : which) {
+                closeQuietly(socks[w]);
+                kick[w] = true;
+            }
+            lock.notifyAll();
+        }
     }
 
     public synchronized void start() {
@@ -109,8 +151,10 @@ public final class Bridge {
         final int g = ++gen;
         dataThread = new Thread(() -> dataLoop(g), "serbridge-data");
         meterThread = new Thread(() -> meterLoop(g), "serbridge-meter");
+        auxThread = new Thread(() -> auxLoop(g), "serbridge-aux");
         dataThread.start();
         meterThread.start();
+        auxThread.start();
     }
 
     /** Окончательно: остановить всё и освободить потоки (при закрытии приложения). */
@@ -121,32 +165,26 @@ public final class Bridge {
     }
 
     public synchronized void stop() {
-        running = false;
-        closeQuietly(dataSock);
-        closeQuietly(meterSock);
         synchronized (lock) {
-            kickData = kickMeter = true;
-            lock.notifyAll();
+            running = false;
         }
+        closeAll();
     }
 
     /** Сменить мост (или задать впервые); текущие соединения рвутся, потоки подключаются заново. */
     public void setTarget(String newHost, int data, int ctrl, int meter) {
-        host = newHost;
-        dataPort = data;
-        ctrlPort = ctrl;
-        meterPort = meter;
+        synchronized (lock) {
+            host = newHost;
+            dataPort = data;
+            ctrlPort = ctrl;
+            meterPort = meter;
+        }
         reconnect();
     }
 
     /** Разорвать соединения и сразу подключиться заново. */
     public void reconnect() {
-        closeQuietly(dataSock);
-        closeQuietly(meterSock);
-        synchronized (lock) {
-            kickData = kickMeter = true;
-            lock.notifyAll();
-        }
+        closeAll();
     }
 
     // ------------------------------------------------------------------ поток данных
@@ -160,7 +198,7 @@ public final class Bridge {
         while (alive(g)) {
             String h = host;
             if (h == null) {
-                pause(true, 1000);
+                pause(K_DATA, 1000);
                 continue;
             }
             Socket s = new Socket();
@@ -169,10 +207,7 @@ public final class Bridge {
                 s.connect(new InetSocketAddress(h, dataPort), 3000);
                 s.setKeepAlive(true);
                 s.setTcpNoDelay(true);
-                // Сначала опубликовать сокет, потом проверить: иначе stop()/setTarget(), пришедшие
-                // между проверкой и публикацией, не смогли бы его закрыть, и поток остался бы висеть.
-                dataSock = s;
-                if (!alive(g) || !h.equals(host)) continue;
+                if (!publish(K_DATA, s, g, h)) continue;
                 wasUp = true;
                 listener.onDataState(true, null);
                 InputStream in = s.getInputStream();
@@ -183,10 +218,10 @@ public final class Bridge {
                 // Соединение закрыли мы сами при смене моста — сообщать не о чем
                 if (alive(g) && h.equals(host)) listener.onDataState(false, wasUp ? "связь прервалась" : describe(e));
             } finally {
-                dataSock = null;
+                unpublish(K_DATA, s);
                 closeQuietly(s);
             }
-            if (alive(g)) pause(true, 2000);
+            if (alive(g)) pause(K_DATA, 2000);
         }
     }
 
@@ -196,7 +231,7 @@ public final class Bridge {
         while (alive(g)) {
             String h = host;
             if (h == null) {
-                pause(false, 1000);
+                pause(K_METER, 1000);
                 continue;
             }
             Socket s = new Socket();
@@ -205,8 +240,7 @@ public final class Bridge {
                 s.connect(new InetSocketAddress(h, meterPort), 3000);
                 s.setKeepAlive(true);
                 s.setSoTimeout(METER_SILENCE_MS);
-                meterSock = s;                              // см. dataLoop: сначала опубликовать
-                if (!alive(g) || !h.equals(host)) continue;
+                if (!publish(K_METER, s, g, h)) continue;
                 listener.onMeterState(true, null);
                 InputStream in = new BufferedInputStream(s.getInputStream(), 2048);
                 ByteArrayOutputStream line = new ByteArrayOutputStream(128);
@@ -227,29 +261,60 @@ public final class Bridge {
             } catch (IOException e) {
                 if (alive(g)) listener.onMeterState(false, null);
             } finally {
-                meterSock = null;
+                unpublish(K_METER, s);
                 closeQuietly(s);
             }
             // Мост слал измерения и вдруг пропал (перезагрузка, обрыв Wi-Fi): соединение данных
             // в таком случае «висит» без признаков обрыва — Android заметит его лишь через часы.
             // Рвём и его, чтобы поток данных переподключился вместе с измерениями.
-            if (gotLine && alive(g) && h.equals(host)) closeQuietly(dataSock);
-            if (alive(g)) pause(false, gotLine ? 300 : 2000);
+            if (gotLine && alive(g) && h.equals(host)) closeAll(K_DATA, K_AUX);
+            if (alive(g)) pause(K_METER, gotLine ? 300 : 2000);
         }
     }
 
-    private void pause(boolean data, long ms) {
+    // ------------------------------------------------------------------ второй приёмник (AUX)
+
+    private void auxLoop(int g) {
+        byte[] buf = new byte[2048];
+        while (alive(g)) {
+            String h = host;
+            if (h == null) {
+                pause(K_AUX, 1000);
+                continue;
+            }
+            Socket s = new Socket();
+            boolean wasUp = false;
+            try {
+                s.connect(new InetSocketAddress(h, AUX_PORT), 3000);
+                s.setKeepAlive(true);
+                s.setTcpNoDelay(true);
+                if (!publish(K_AUX, s, g, h)) continue;
+                wasUp = true;
+                listener.onAuxState(true);
+                InputStream in = s.getInputStream();
+                int n;
+                while ((n = in.read(buf)) > 0 && alive(g)) listener.onAuxBytes(Arrays.copyOf(buf, n));
+            } catch (IOException e) {
+                // старая прошивка без порта 2327 или нет связи — тихо пробуем позже
+            } finally {
+                unpublish(K_AUX, s);
+                closeQuietly(s);
+            }
+            if (wasUp && alive(g)) listener.onAuxState(false);
+            if (alive(g)) pause(K_AUX, wasUp ? 2000 : 5000);
+        }
+    }
+
+    private void pause(int which, long ms) {
         synchronized (lock) {
-            boolean kicked = data ? kickData : kickMeter;
-            if (!kicked) {
+            if (!kick[which]) {
                 try {
                     lock.wait(ms);
                 } catch (InterruptedException ignored) {
                     Thread.currentThread().interrupt();
                 }
             }
-            if (data) kickData = false;
-            else kickMeter = false;
+            kick[which] = false;
         }
     }
 
@@ -257,7 +322,7 @@ public final class Bridge {
 
     public void send(final byte[] bytes) {
         sendIo.execute(() -> {
-            Socket s = dataSock;
+            Socket s = sock(K_DATA);
             if (s == null) {
                 listener.onSendFailed("нет связи с мостом — не отправлено");
                 return;

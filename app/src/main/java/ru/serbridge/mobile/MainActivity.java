@@ -58,6 +58,7 @@ public class MainActivity extends Activity implements Bridge.Listener, Meter.Eve
     private static final int C_GOOD = 0xFF81C784;
     private static final int C_DIM = 0xFF8A8F96;
     private static final int C_LABEL = 0xFF4DB6AC;
+    private static final int C_AUX = 0xFFCE93D8;    // второй поток (XP2.6)
 
     private static final int MAX_LINES = 5000;
     private static final int[] BAUDS = {9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600};
@@ -71,6 +72,7 @@ public class MainActivity extends Activity implements Bridge.Listener, Meter.Eve
     private final Handler ui = new Handler(Looper.getMainLooper());
     private Bridge bridge;
     private final Meter meter = new Meter();
+    private final AuxView aux = new AuxView();
     private SharedPreferences prefs;
 
     private TextView panel;
@@ -110,6 +112,8 @@ public class MainActivity extends Activity implements Bridge.Listener, Meter.Eve
         showMinMax = prefs.getBoolean("minmax", true);
         keepScreen = prefs.getBoolean("screen", true);
         fontSp = prefs.getFloat("font", 13f);
+        aux.setMode(prefs.getString("auxview", "auto"));
+        aux.ldPeriodSec = prefs.getInt("auxperiod", 0);
         if (keepScreen) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
         panel = findViewById(R.id.panel);
@@ -228,6 +232,9 @@ public class MainActivity extends Activity implements Bridge.Listener, Meter.Eve
     private final Runnable tick = new Runnable() {
         @Override
         public void run() {
+            List<AuxView.Line> out = new ArrayList<>();
+            aux.tick(System.currentTimeMillis(), out);
+            showAuxLines(out);
             renderPanel();
             updateSubtitle();
             ui.postDelayed(this, 1000);
@@ -285,6 +292,36 @@ public class MainActivity extends Activity implements Bridge.Listener, Meter.Eve
     @Override
     public void onSendFailed(String why) {
         ui.post(() -> warn(why));
+    }
+
+    @Override
+    public void onAuxBytes(byte[] data) {
+        ui.post(() -> {
+            List<AuxView.Line> out = new ArrayList<>();
+            aux.feed(data, System.currentTimeMillis(), out);
+            showAuxLines(out);
+            if (aux.last != null) renderPanel();
+        });
+    }
+
+    @Override
+    public void onAuxState(boolean connected) {
+        ui.post(() -> {
+            List<AuxView.Line> out = new ArrayList<>();
+            aux.tick(Long.MAX_VALUE, out);        // недописанную строку — показать
+            showAuxLines(out);
+            aux.onReconnect();
+        });
+    }
+
+    /** Строки второго потока: «AUX›» и свой цвет; события — всегда с меткой времени. */
+    private void showAuxLines(List<AuxView.Line> out) {
+        for (AuxView.Line l : out) {
+            String t = (l.event ? stamp() : timestamps ? clock() : "") + "AUX› " + l.text;
+            int c = l.kind == AuxView.GOOD ? C_GOOD : l.kind == AuxView.WARN ? C_WARN
+                    : l.kind == AuxView.INFO ? C_INFO : C_AUX;
+            addLine(t, c);
+        }
     }
 
     // =================================================================== Meter.Events (главный поток)
@@ -441,7 +478,8 @@ public class MainActivity extends Activity implements Bridge.Listener, Meter.Eve
     private void renderPanel() {
         boolean showT = meter.targetFresh();
         boolean showV = meter.hasData;
-        if (!showT && !showV) {
+        String radar = aux.panelText(System.currentTimeMillis());
+        if (!showT && !showV && radar == null) {
             panel.setVisibility(View.GONE);
             return;
         }
@@ -469,6 +507,11 @@ public class MainActivity extends Activity implements Bridge.Listener, Meter.Eve
                 if (sb.length() > 0) sb.append(sep);
                 put(sb, "(нет новых данных)", C_DIM);
             }
+        }
+        if (radar != null) {
+            if (sb.length() > 0) sb.append(sep);
+            put(sb, "Радар ", C_LABEL);
+            put(sb, radar, radar.equals("нет данных") ? C_DIM : radar.equals("никого") ? C_TEXT : C_GOOD);
         }
         panel.setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSp);
         panel.setText(sb);
@@ -590,6 +633,9 @@ public class MainActivity extends Activity implements Bridge.Listener, Meter.Eve
             case "aux":
                 remote(arg.isEmpty() ? "aux" : "aux " + arg);
                 break;
+            case "auxview":
+                auxView(arg);
+                break;
             case "bridge":
                 if (arg.isEmpty()) warn("Укажите команду мосту, например «:bridge help»");
                 else remote(arg);
@@ -602,6 +648,48 @@ public class MainActivity extends Activity implements Bridge.Listener, Meter.Eve
                 break;
             default:
                 warn("Неизвестная команда «:" + cmd + "». «:help» — список команд.");
+        }
+    }
+
+    /** «:auxview [auto|text|hex|ld2410 [с]|off]» — как показывать второй поток (XP2.6). */
+    private void auxView(String arg) {
+        String[] p = arg.isEmpty() ? new String[0] : arg.toLowerCase(Locale.ROOT).split("\\s+");
+        if (p.length == 0) {
+            info("Второй поток (XP2.6): показ «" + aux.mode + "»" + (aux.ldPeriodSec > 0
+                    ? ", радар — строка раз в " + aux.ldPeriodSec + " с" : "")
+                    + "; принято " + aux.rxBytes + " байт; кадров LD2410: " + aux.ld.frames
+                    + ", испорченных " + aux.ld.badFrames);
+            info("Варианты: auto | text | hex | ld2410 [секунд] | off. Включить приём на мосту: «:aux uart 256000»");
+            return;
+        }
+        if (!Arrays.asList(AuxView.MODES).contains(p[0])) {
+            warn("Варианты: auto | text | hex | ld2410 [секунд] | off");
+            return;
+        }
+        List<AuxView.Line> out = new ArrayList<>();
+        aux.tick(Long.MAX_VALUE, out);
+        showAuxLines(out);
+        aux.setMode(p[0]);
+        if (p[0].equals("ld2410") || p[0].equals("auto")) {
+            int sec = p.length > 1 ? Bridge.toInt(p[1], -1) : 0;
+            if (sec < 0 || sec > 3600) {
+                warn("Период — целое число секунд 0…3600 (0 — только при появлении и уходе человека)");
+                sec = 0;
+            }
+            aux.ldPeriodSec = sec;
+        }
+        prefs.edit().putString("auxview", aux.mode).putInt("auxperiod", aux.ldPeriodSec).apply();
+        info("Второй поток (XP2.6): " + describeAuxMode());
+        renderPanel();
+    }
+
+    private String describeAuxMode() {
+        switch (aux.mode) {
+            case "text": return "текст";
+            case "hex": return "шестнадцатеричный вывод";
+            case "ld2410": return "радар LD2410" + (aux.ldPeriodSec > 0 ? ", строка раз в " + aux.ldPeriodSec + " с" : "");
+            case "off": return "не показывать";
+            default: return "auto — радар LD2410 узнаётся сам, остальное текстом или hex";
         }
     }
 
@@ -784,8 +872,15 @@ public class MainActivity extends Activity implements Bridge.Listener, Meter.Eve
             info("Питание МК: " + v(kv, "tvcc").replace('.', ',') + " В, " + pw);
         }
         info("АЦП: " + v(kv, "adc") + ", сбоев I2C " + v(kv, "adcerr"));
-        if (kv.containsKey("aux"))
+        if ("uart".equals(kv.get("auxmode"))) {
+            info("AUX (XP2.6): приём UART " + v(kv, "auxbaud") + " бод; принято " + v(kv, "auxrx")
+                    + " байт, ошибок кадра " + v(kv, "auxerr") + ", переполнений " + v(kv, "auxovf")
+                    + "; клиентов " + v(kv, "auxcl"));
+            if (aux.ld.frames > 0 || aux.ld.badFrames > 0)
+                info("Радар LD2410: кадров " + aux.ld.frames + ", испорченных " + aux.ld.badFrames);
+        } else if (kv.containsKey("aux")) {
             info("AUX (XP2.6): " + v(kv, "aux") + ("low".equals(kv.get("auxmode")) ? " — мост тянет к нулю" : " — отпущена"));
+        }
         info("Работает " + uptime(Bridge.toInt(kv.get("uptime"), -1)) + "; свободно памяти " + v(kv, "heap") + " байт");
     }
 
@@ -819,6 +914,8 @@ public class MainActivity extends Activity implements Bridge.Listener, Meter.Eve
         info(":eol lf|crlf|cr|none — окончание строк;   :time — метки времени;   :hex — шестнадцатеричный вывод");
         info(":tx 01 02 FF — отправить байты;   :clear — очистить экран;   :share — поделиться журналом");
         info(":reset [мс] — сбросить МК (XP2.5);   :aux [0|1|pulse мс] — доп. линия XP2.6");
+        info(":aux uart 256000 — XP2.6 становится вторым приёмником (TX другого устройства), :aux off — обратно");
+        info(":auxview auto|text|hex|ld2410 [с]|off — как показывать второй поток (строки «AUX›»)");
         info(":v … — вольтметр (:v — подробнее);   :bridge <команда> — команда мосту (ssid, pass, name, tsense, tcal, help)");
         info("Долгое нажатие на ➤ — история строк. Остальное — в меню ⋮.");
     }
